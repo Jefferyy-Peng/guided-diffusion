@@ -24,7 +24,8 @@ def setup_dist():
     """
     if dist.is_initialized():
         return
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"6"
 
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
@@ -40,6 +41,10 @@ def setup_dist():
     port = comm.bcast(_find_free_port(), root=0)
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend=backend, init_method="env://")
+
+    # Ensure all operations are performed on cuda:6
+    if th.cuda.is_available():
+        th.cuda.set_device(0)
 
 
 def dev():
