@@ -8,6 +8,7 @@ import os
 
 import numpy as np
 import torch as th
+import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -20,14 +21,15 @@ from guided_diffusion.script_util import (
     create_model_and_diffusion,
     create_classifier,
     add_dict_to_argparser,
-    args_to_dict,
+    args_to_dict, create_Resnet,
 )
+from guided_diffusion.utils import get_trainable_params
 
 
 def main():
     args = create_argparser().parse_args()
     args.attention_resolutions = '32,16,8'
-    args.class_cond = True
+    args.class_cond = False
     args.diffusion_steps = 1000
     args.image_size = 256
     args.learn_sigma = True
@@ -39,14 +41,28 @@ def main():
     args.use_scale_shift_norm = True
     args.clip_denoised = True
     args.num_samples = 100
-    args.batch_size = 4
+    args.batch_size = 100
     args.use_ddim = False
-    args.model_path = "../models/256x256_diffusion.pt"
-    args.classifier_path = "../models/256x256_classifier.pt"
+    args.model_path = "../models/256x256_diffusion_uncond.pt"
+    args.classifier_path = "../models/best_resnet_model.pth"
     args.classifier_scale = 1.0
     args.timestep_respacing = '250'
+    args.guidence_mode = 'weight'
+    args.extraction_loss_type = 'kkt'
+    args.extraction_regression = False
+    args.output_dim = 1000
+    args.extraction_data_amount = args.batch_size
+    # args.extraction_data_amount_per_class = 500
+    # args.extraction_epochs = 50000
+    # args.extraction_evaluate_rate = 1000
+    # args.extraction_init_scale = 0.004473685426131403
+    # args.extraction_lr = 0.3462076508871333
+    args.extraction_min_lambda = 0.4935914336068267
+    # args.extraction_model_relu_alpha = 21.679355102650792
+    device_num = 7
+    device = f'cuda:0'
 
-    dist_util.setup_dist()
+    dist_util.setup_dist(device_num)
     logger.configure()
 
     logger.log("creating model and diffusion...")
@@ -56,20 +72,23 @@ def main():
     model.load_state_dict(
         dist_util.load_state_dict(args.model_path, map_location="cpu")
     )
-    model.to('cuda:0')
+    model.to(device)
     if args.use_fp16:
         model.convert_to_fp16()
     model.eval()
+    # model = nn.DataParallel(model)
 
     logger.log("loading classifier...")
-    classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
+    # classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
+    classifier = create_Resnet()
     classifier.load_state_dict(
         dist_util.load_state_dict(args.classifier_path, map_location="cpu")
     )
-    classifier.to('cuda:0')
+    classifier.to(device)
     if args.classifier_use_fp16:
         classifier.convert_to_fp16()
     classifier.eval()
+    # classifier = nn.DataParallel(classifier)
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -88,22 +107,27 @@ def main():
     all_images = []
     all_labels = []
     while len(all_images) * args.batch_size < args.num_samples:
+        l, opt_l = get_trainable_params(args, device)
         model_kwargs = {}
-        # classes = th.randint(
-        #     low=0, high=NUM_CLASSES, size=(args.batch_size,), device='cuda:0'
-        # )
-        classes = th.full((args.batch_size,), 97).to('cuda:0') # create class for drake
+        classes = th.randint(
+            low=0, high=NUM_CLASSES, size=(args.batch_size,), device=device
+        )
+        # classes = th.full((args.batch_size,), 97).to('cuda:0') # create class for drake
         model_kwargs["y"] = classes
+        args.l = l
+        args.opt_l = opt_l
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
         sample = sample_fn(
+            args,
             model_fn,
+            classifier,
             (args.batch_size, 3, args.image_size, args.image_size),
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
             cond_fn=cond_fn,
-            device='cuda:0',
+            device=device,
         )
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)

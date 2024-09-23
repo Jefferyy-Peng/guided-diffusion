@@ -1,11 +1,13 @@
 import argparse
 import inspect
+import torch.nn as nn
+from torchvision import models
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 from .unet import SuperResModel, UNetModel, EncoderUNetModel
 
-NUM_CLASSES = 1000
+NUM_CLASSES = 4
 
 
 def diffusion_defaults():
@@ -264,6 +266,12 @@ def create_classifier(
         resblock_updown=classifier_resblock_updown,
         pool=classifier_pool,
     )
+
+def create_Resnet():
+    model = models.resnet18(pretrained=False)
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, NUM_CLASSES)
+    return model
 
 
 def sr_model_and_diffusion_defaults():

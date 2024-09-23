@@ -18,14 +18,15 @@ GPUS_PER_NODE = 8
 SETUP_RETRY_COUNT = 3
 
 
-def setup_dist():
+def setup_dist(device_num):
     """
     Setup a distributed process group.
     """
     if dist.is_initialized():
         return
-    # os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
-    os.environ["CUDA_VISIBLE_DEVICES"] = f"6"
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = f"{device_num}"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = f"0,1,2,3,4,5,6,7"
 
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
@@ -42,9 +43,9 @@ def setup_dist():
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend=backend, init_method="env://")
 
-    # Ensure all operations are performed on cuda:6
-    if th.cuda.is_available():
-        th.cuda.set_device(0)
+    # # Ensure all operations are performed on cuda:6
+    # if th.cuda.is_available():
+    #     th.cuda.set_device(0)
 
 
 def dev():

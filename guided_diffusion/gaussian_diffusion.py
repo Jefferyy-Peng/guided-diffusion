@@ -9,10 +9,12 @@ import enum
 import math
 
 import numpy as np
+import torch
 import torch as th
 
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
+from .utils import calc_extraction_loss, get_kkt_loss, get_verify_loss
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
@@ -368,6 +370,31 @@ class GaussianDiffusion:
         )
         return new_mean
 
+    def weight_guided_mean(self, args, l, model_out, x, t, classifier, model_kwargs=None):
+        """
+        Compute the mean for the previous step, given a function cond_fn that
+        computes the gradient of a conditional log probability with respect to
+        x. In particular, cond_fn computes grad(log(p(y|x))), and we want to
+        condition on y.
+
+        This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
+        """
+        # x_in = x.detach().requires_grad_(True)
+        # values = classifier(x_in, t).squeeze()
+        x_in = model_out['pred_xstart'].detach().requires_grad_(True)
+        values = classifier(x_in) # use estimated clean image for classifier input
+        loss, kkt_loss, loss_verify = calc_extraction_loss(args, l, classifier, values, x, model_kwargs['y'])
+        # logits = classifier(x_in, t)
+        # log_probs = F.log_softmax(logits, dim=-1)
+        # selected = log_probs[range(len(logits)), y.view(-1)]
+        # gradient = th.autograd.grad(loss, x_in)[0] * args.classifier_scale
+        loss.backward()
+        gradient = x_in.grad * args.classifier_scale
+        new_mean = (
+            model_out["mean"].float() + model_out["variance"] * gradient.float()
+        )
+        return new_mean
+
     def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
         Compute what the p_mean_variance output would have been, should the
@@ -394,6 +421,7 @@ class GaussianDiffusion:
 
     def p_sample(
         self,
+        args,
         model,
         x,
         t,
@@ -438,9 +466,69 @@ class GaussianDiffusion:
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
+    def p_sample_weight_guided(
+        self,
+        args,
+        model,
+        classifier,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+    ):
+        """
+        Sample x_{t-1} from the model at the given timestep.
+
+        :param model: the model to sample from.
+        :param x: the current tensor at x_{t-1}.
+        :param t: the value of t, starting at 0 for the first diffusion step.
+        :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample.
+        :param cond_fn: if not None, this is a gradient function that acts
+                        similarly to the model.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict containing the following keys:
+                 - 'sample': a random sample from the model.
+                 - 'pred_xstart': a prediction of x_0.
+        """
+        if args.guidence_mode == 'weight':
+            with torch.no_grad():
+                out = self.p_mean_variance(
+                    model,
+                    x,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    model_kwargs=model_kwargs,
+                )
+        else:
+            out = self.p_mean_variance(
+                model,
+                x,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                model_kwargs=model_kwargs,
+            )
+        noise = th.randn_like(x)
+        nonzero_mask = (
+            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        )  # no noise when t == 0
+        out["mean"] = self.weight_guided_mean(
+                args, args.l, out, x, t, classifier, model_kwargs=model_kwargs
+            )
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
     def p_sample_loop(
         self,
+        args,
         model,
+        classifier,
         shape,
         noise=None,
         clip_denoised=True,
@@ -470,19 +558,107 @@ class GaussianDiffusion:
         :return: a non-differentiable batch of samples.
         """
         final = None
-        for sample in self.p_sample_loop_progressive(
-            model,
-            shape,
-            noise=noise,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            cond_fn=cond_fn,
-            model_kwargs=model_kwargs,
-            device=device,
-            progress=progress,
-        ):
-            final = sample
+        if args.guidence_mode == 'weight':
+            for sample in self.p_sample_loop_progressive_weight_guided(
+                args,
+                model,
+                classifier,
+                shape,
+                noise=noise,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                model_kwargs=model_kwargs,
+                device=device,
+                progress=progress,
+            ):
+                final = sample
+        elif args.guidence_mode == 'output_loss':
+            for sample in self.p_sample_loop_progressive(
+                args,
+                model,
+                shape,
+                noise=noise,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+                device=device,
+                progress=progress,
+            ):
+                final = sample
+
         return final["sample"]
+
+    def p_sample_loop_progressive_weight_guided(
+        self,
+        args,
+        model,
+        classifier,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        """
+        Generate samples from the model guided by model weight and yield intermediate samples from
+        each timestep of diffusion.
+
+        Arguments are the same as p_sample_loop().
+        Returns a generator over dicts, where each dict is the return value of
+        p_sample().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        # if args.guidence_mode == 'weight':
+        #     if noise is not None:
+        #         img = noise.requires_grad_(True)
+        #     else:
+        #         img = th.randn(*shape, device=device, requires_grad=True)
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            if args.guidence_mode == 'weight':
+                out = self.p_sample_weight_guided(
+                    args,
+                    model,
+                    classifier,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    model_kwargs=model_kwargs,
+                )
+                yield out
+                img = out["sample"]
+            else:
+                with th.no_grad():
+                    out = self.p_sample_weight_guided(
+                        args,
+                        model,
+                        classifier,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        model_kwargs=model_kwargs,
+                    )
+                    yield out
+                    img = out["sample"]
 
     def p_sample_loop_progressive(
         self,
