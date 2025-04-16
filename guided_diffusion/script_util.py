@@ -4,6 +4,7 @@ import torch.nn as nn
 from torchvision import models
 
 from . import gaussian_diffusion as gd
+from .models import Mobilevit
 from .respace import SpacedDiffusion, space_timesteps
 from .unet import SuperResModel, UNetModel, EncoderUNetModel
 
@@ -267,10 +268,37 @@ def create_classifier(
         pool=classifier_pool,
     )
 
-def create_Resnet():
+def create_Resnet(number_classes):
     model = models.resnet18(pretrained=False)
     num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, NUM_CLASSES)
+    model.fc = nn.Linear(num_ftrs, number_classes)
+    return model
+
+def create_Mobilevit():
+    model = Mobilevit()
+    return model
+
+def create_mlp():
+    class OneLayerMLP(nn.Module):
+        def __init__(self, input_shape=(60, 3, 256, 256), output_size=100):
+            super(OneLayerMLP, self).__init__()
+
+            # Calculate the flattened input size (3 * 256 * 256)
+            self.flattened_input_size = input_shape[1] * input_shape[2] * input_shape[3]
+
+            # Define a fully connected layer
+            self.fc = nn.Linear(self.flattened_input_size, output_size)
+
+        def forward(self, x):
+            # Flatten the input (batch size is preserved)
+            x = x.view(x.size(0), -1)  # This flattens all dimensions except the batch size
+
+            # Apply the fully connected layer
+            out = self.fc(x)
+
+            return out
+
+    model = OneLayerMLP(output_size=NUM_CLASSES)
     return model
 
 

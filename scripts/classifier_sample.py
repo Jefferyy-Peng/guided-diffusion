@@ -21,7 +21,7 @@ from guided_diffusion.script_util import (
     create_model_and_diffusion,
     create_classifier,
     add_dict_to_argparser,
-    args_to_dict, create_Resnet,
+    args_to_dict, create_Resnet, create_mlp, create_Mobilevit,
 )
 from guided_diffusion.utils import get_trainable_params
 
@@ -40,24 +40,30 @@ def main():
     args.use_fp16 = True
     args.use_scale_shift_norm = True
     args.clip_denoised = True
-    args.num_samples = 100
-    args.batch_size = 100
+    args.num_samples = 80
+    args.batch_size = 80
     args.use_ddim = False
     args.model_path = "../models/256x256_diffusion_uncond.pt"
     args.classifier_path = "../models/best_resnet_model.pth"
-    args.classifier_scale = 1.0
+    args.classifier_scale = 100.0
     args.timestep_respacing = '250'
+    # args.guidence_mode = 'output_loss'
     args.guidence_mode = 'weight'
     args.extraction_loss_type = 'kkt'
     args.extraction_regression = False
     args.output_dim = 1000
     args.extraction_data_amount = args.batch_size
+    # args.plot_path = 'kktscale_100_batch_80_no_xconstrain_SGD'
+    # args.plot_path = 'output_guided_scale_10'
+    args.plot_path = 'kktscale_100_batch_80_no_xconstrain_SGD'
+    args.noise_input = False
+    args.x_constrain = False
     # args.extraction_data_amount_per_class = 500
     # args.extraction_epochs = 50000
     # args.extraction_evaluate_rate = 1000
     # args.extraction_init_scale = 0.004473685426131403
-    # args.extraction_lr = 0.3462076508871333
-    args.extraction_min_lambda = 0.4935914336068267
+    args.extraction_lr = 3.4e-3
+    args.extraction_min_lambda = 0.10320890155329197
     # args.extraction_model_relu_alpha = 21.679355102650792
     device_num = 7
     device = f'cuda:0'
@@ -76,19 +82,24 @@ def main():
     if args.use_fp16:
         model.convert_to_fp16()
     model.eval()
-    # model = nn.DataParallel(model)
+    model = nn.DataParallel(model)
 
     logger.log("loading classifier...")
     # classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
-    classifier = create_Resnet()
-    classifier.load_state_dict(
-        dist_util.load_state_dict(args.classifier_path, map_location="cpu")
-    )
+    classifier = create_Resnet(1000)
+    # classifier = create_Mobilevit()
+    # classifier.load_state_dict(
+    #     dist_util.load_state_dict(args.classifier_path, map_location="cpu")
+    # )
+    # classifier = create_mlp()
     classifier.to(device)
     if args.classifier_use_fp16:
         classifier.convert_to_fp16()
     classifier.eval()
-    # classifier = nn.DataParallel(classifier)
+    classifier = nn.DataParallel(classifier)
+    classifier.load_state_dict(
+        dist_util.load_state_dict(args.classifier_path, map_location="cpu")
+    )
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -114,13 +125,13 @@ def main():
         )
         # classes = th.full((args.batch_size,), 97).to('cuda:0') # create class for drake
         model_kwargs["y"] = classes
-        args.l = l
-        args.opt_l = opt_l
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
         sample = sample_fn(
             args,
+            opt_l,
+            l,
             model_fn,
             classifier,
             (args.batch_size, 3, args.image_size, args.image_size),
@@ -128,6 +139,7 @@ def main():
             model_kwargs=model_kwargs,
             cond_fn=cond_fn,
             device=device,
+            progress=True,
         )
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
@@ -150,13 +162,13 @@ def main():
         out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
         logger.log(f"saving to {out_path}")
         np.savez(out_path, arr, label_arr)
-
+    os.makedirs(f'../plots/{args.plot_path}', exist_ok=True)
     with open("../imagenet_classes.txt", "r") as f:
         imagenet_labels = [line.strip() for line in f.readlines()]
     for i, img in enumerate(arr):
         plt.imshow(img)
         plt.title(f'{imagenet_labels[label_arr[i]]}')
-        plt.savefig(f'../plots/{i}.png')
+        plt.savefig(f'../plots/{args.plot_path}/{i}.png')
         plt.close()
 
     dist.barrier()

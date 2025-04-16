@@ -6,6 +6,9 @@ from torch.utils.data import DataLoader, Subset, random_split
 import random
 import os
 import pickle
+from torch.nn import DataParallel
+from guided_diffusion.utils import Random_Crop_Arr
+from tqdm import tqdm
 
 # Set device: use GPU if available, otherwise fall back to CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -14,8 +17,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 data_transforms = {
     'train': transforms.Compose([
         transforms.Resize((256, 256)),  # Resize images to 256x256
+        Random_Crop_Arr(256),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),  # Convert image to tensor
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Normalize to ImageNet stats
+        # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Normalize to ImageNet stats
     ])
 }
 
@@ -34,7 +39,7 @@ class_to_idx = image_datasets.class_to_idx
 # dataset_sizes = {x: len(image_datasets[x]) for x in ['train']}
 # class_names = image_datasets['train'].classes
 
-# Get indices of images that belong to the selected classes
+# # Get indices of images that belong to the selected classes
 # selected_indices = []
 # for target_class in selected_class_indices:
 #     count = 0
@@ -47,37 +52,41 @@ class_to_idx = image_datasets.class_to_idx
 # with open('../data_index.p', 'wb') as f:
 #     pickle.dump(selected_indices, f)
 
-with open('../data_index.p', 'rb') as f:
-    selected_indices = pickle.load(f)
-# Create a subset with only the selected images
-subset_dataset = Subset(image_datasets, selected_indices)
+# with open('../data_index.p', 'rb') as f:
+#     selected_indices = pickle.load(f)
+# # Create a subset with only the selected images
+# subset_dataset = Subset(image_datasets, selected_indices)
 
-train_size = int(0.8 * len(subset_dataset))  # 80% training, 20% validation
-val_size = len(subset_dataset) - train_size
-train_dataset, val_dataset = random_split(subset_dataset, [train_size, val_size])
+# train_size = int(0.8 * len(subset_dataset))  # 80% training, 20% validation
+# val_size = len(subset_dataset) - train_size
+# train_dataset, val_dataset = random_split(subset_dataset, [train_size, val_size])
+
+train_size = int(0.8 * len(image_datasets))  # 80% training, 20% validation
+val_size = len(image_datasets) - train_size
+train_dataset, val_dataset = random_split(image_datasets, [train_size, val_size])
 
 # DataLoader for the selected subset
-train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
-val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=4)
+train_dataloader = DataLoader(train_dataset, batch_size=250, shuffle=True, num_workers=12)
+val_dataloader = DataLoader(val_dataset, batch_size=250, shuffle=False, num_workers=12)
 
-# Get size of subset dataset
-subset_size = len(subset_dataset)
-
-# Get class names
-subset_class_names = [image_datasets.classes[idx] for idx in selected_class_indices]
+# # Get size of subset dataset
+# subset_size = len(subset_dataset)
+#
+# # Get class names
+# subset_class_names = [image_datasets.classes[idx] for idx in selected_class_indices]
 
 
 # Load the pre-trained ResNet model and modify for our dataset
 model = models.resnet18(pretrained=True)
 num_ftrs = model.fc.in_features
-model.fc = nn.Linear(num_ftrs, len(subset_class_names))  # Adjust output layer for the number of classes
+model.fc = nn.Linear(num_ftrs, 1000)  # Adjust output layer for the number of classes
 
 # Move the model to the GPU if available
-model = model.to(device)
+model = DataParallel(model).to(device)
 
 # Set up loss function and optimizer
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
 best_val_acc = 0.0  # Track the best validation accuracy
 num_epochs = 100
 for epoch in range(num_epochs):
@@ -88,7 +97,7 @@ for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
     running_corrects = 0
-    for inputs, labels in train_dataloader:
+    for inputs, labels in tqdm(train_dataloader):
         inputs, labels = inputs.to(device), labels.to(device)
 
         optimizer.zero_grad()
@@ -111,7 +120,7 @@ for epoch in range(num_epochs):
     val_loss = 0.0
     val_corrects = 0
     with torch.no_grad():
-        for inputs, labels in val_dataloader:
+        for inputs, labels in tqdm(val_dataloader):
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs = model(inputs)

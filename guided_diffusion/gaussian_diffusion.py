@@ -4,17 +4,22 @@ https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0
 
 Docstrings have been added, as well as DDIM sampling and a new collection of beta schedules.
 """
-
+import torch.nn.functional as F
 import enum
+import gc
 import math
+import os
 
 import numpy as np
 import torch
 import torch as th
+import torchviz
+from matplotlib import pyplot as plt
 
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
-from .utils import calc_extraction_loss, get_kkt_loss, get_verify_loss
+from .utils import calc_extraction_loss, get_kkt_loss, get_verify_loss, get_tracked_tensors, print_tracked_tensor_diff
+from tqdm import tqdm
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
@@ -364,7 +369,7 @@ class GaussianDiffusion:
 
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
         """
-        gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        gradient = cond_fn(x, p_mean_var['pred_xstart'], self._scale_timesteps(t), **model_kwargs)
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
         )
@@ -379,21 +384,31 @@ class GaussianDiffusion:
 
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
         """
-        # x_in = x.detach().requires_grad_(True)
-        # values = classifier(x_in, t).squeeze()
-        x_in = model_out['pred_xstart'].detach().requires_grad_(True)
-        values = classifier(x_in) # use estimated clean image for classifier input
+        values = classifier(model_out['pred_xstart']) # use estimated clean image for classifier input
         loss, kkt_loss, loss_verify = calc_extraction_loss(args, l, classifier, values, x, model_kwargs['y'])
-        # logits = classifier(x_in, t)
-        # log_probs = F.log_softmax(logits, dim=-1)
-        # selected = log_probs[range(len(logits)), y.view(-1)]
-        # gradient = th.autograd.grad(loss, x_in)[0] * args.classifier_scale
-        loss.backward()
-        gradient = x_in.grad * args.classifier_scale
+        gradient = th.autograd.grad(loss, (x, l))
+        grad_x, grad_l = gradient
+        grad_x = grad_x * args.classifier_scale
+        # graph = torchviz.make_dot(loss)
+        #
+        # # Render the graph in a PDF or image
+        # import os
+        # os.environ['RDMAV_FORK_SAFE'] = '1'
+        # graph.render("../plots/computation_graph", format="pdf")
+        # loss.backward()
+        # gradient = x.grad
         new_mean = (
-            model_out["mean"].float() + model_out["variance"] * gradient.float()
+            model_out["mean"].float() + model_out["variance"] * grad_x.float()
         )
-        return new_mean
+        l = l - grad_l * args.extraction_lr
+        # new_mean = (
+        #     model_out["mean"].float()
+        # )
+        print(f'x_grad mean:{grad_x.mean()}')
+        print(f'l_grad mean:{grad_l.mean()}')
+        print(f'x mean:{new_mean.mean()}')
+        print(f'l mean:{l.mean()}')
+        return new_mean, l, loss.detach()
 
     def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
@@ -423,6 +438,7 @@ class GaussianDiffusion:
         self,
         args,
         model,
+        classifier,
         x,
         t,
         clip_denoised=True,
@@ -460,17 +476,28 @@ class GaussianDiffusion:
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
         if cond_fn is not None:
-            out["mean"] = self.condition_mean(
-                cond_fn, out, x, t, model_kwargs=model_kwargs
-            )
+            if args.noise_input:
+                out["mean"] = self.condition_mean(
+                    cond_fn, out, x, t, args, model_kwargs=model_kwargs
+                )
+            else:
+                # x_in = x.detach().requires_grad_(True)
+                logits = classifier(out['pred_xstart'])
+                log_probs = F.log_softmax(logits, dim=-1)
+                selected = log_probs[range(len(logits)), model_kwargs['y'].view(-1)]
+                grad = th.autograd.grad(selected.sum(), x)[0] * args.classifier_scale
+                out['mean'] = (
+                        out["mean"].float() + out["variance"] * grad.float()
+                )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        if args.noise_input or args.guidence_mode == 'weight':
+            return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        else:
+            return {"sample": sample, "pred_xstart": out["pred_xstart"]}, selected.sum().item()
 
     def p_sample_weight_guided(
         self,
-        args,
         model,
-        classifier,
         x,
         t,
         clip_denoised=True,
@@ -495,38 +522,39 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
-        if args.guidence_mode == 'weight':
-            with torch.no_grad():
-                out = self.p_mean_variance(
-                    model,
-                    x,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    model_kwargs=model_kwargs,
-                )
-        else:
-            out = self.p_mean_variance(
-                model,
-                x,
-                t,
-                clip_denoised=clip_denoised,
-                denoised_fn=denoised_fn,
-                model_kwargs=model_kwargs,
-            )
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+
+        # old_tensors = get_tracked_tensors()
         noise = th.randn_like(x)
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
-        out["mean"] = self.weight_guided_mean(
-                args, args.l, out, x, t, classifier, model_kwargs=model_kwargs
+        # out = {'pred_xstart': x * torch.ones((60,3,256,256)).to(x.device),'mean': x * torch.ones((60,3,256,256)).to(x.device), 'variance': x * torch.ones((60,3,256,256)).to(x.device),'log_variance': x * torch.ones((60,3,256,256)).to(x.device)}
+        # out["mean"], l, loss = self.weight_guided_mean(
+        #         args, l, out, x, t, classifier, model_kwargs=model_kwargs
+        #     )
+        if cond_fn is not None:
+            out["mean"] = self.condition_mean(
+                cond_fn, out, x, t, model_kwargs=model_kwargs
             )
+        # new_tensors = get_tracked_tensors()
+        # print_tracked_tensor_diff(old_tensors, new_tensors)
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        # return {"sample": sample, "pred_xstart": out["pred_xstart"]}, l, loss
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_loop(
         self,
         args,
+        opt_l,
+        l,
         model,
         classifier,
         shape,
@@ -561,6 +589,8 @@ class GaussianDiffusion:
         if args.guidence_mode == 'weight':
             for sample in self.p_sample_loop_progressive_weight_guided(
                 args,
+                opt_l,
+                l,
                 model,
                 classifier,
                 shape,
@@ -576,6 +606,7 @@ class GaussianDiffusion:
             for sample in self.p_sample_loop_progressive(
                 args,
                 model,
+                classifier,
                 shape,
                 noise=noise,
                 clip_denoised=clip_denoised,
@@ -586,12 +617,16 @@ class GaussianDiffusion:
                 progress=progress,
             ):
                 final = sample
+        else:
+            raise NotImplementedError
 
         return final["sample"]
 
     def p_sample_loop_progressive_weight_guided(
         self,
         args,
+        opt_l,
+        l,
         model,
         classifier,
         shape,
@@ -601,6 +636,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        cond_fn=None,
     ):
         """
         Generate samples from the model guided by model weight and yield intermediate samples from
@@ -630,39 +666,109 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
+        # # Track tensors over iterations
+        # old_tensors = get_tracked_tensors()  # Initial set of tracked tensors
+        losses = []
+        kkt_losses = []
+
+        viz_iter = [1, 50, 100, 150, 200, 250, 300, 350, 400, 450]
+
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
-            if args.guidence_mode == 'weight':
-                out = self.p_sample_weight_guided(
-                    args,
-                    model,
-                    classifier,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    model_kwargs=model_kwargs,
-                )
-                yield out
-                img = out["sample"]
-            else:
-                with th.no_grad():
-                    out = self.p_sample_weight_guided(
-                        args,
-                        model,
-                        classifier,
-                        img,
-                        t,
-                        clip_denoised=clip_denoised,
-                        denoised_fn=denoised_fn,
-                        model_kwargs=model_kwargs,
-                    )
-                    yield out
-                    img = out["sample"]
+
+            img = img.requires_grad_()
+            # l = l.requires_grad_()
+            out = self.p_sample(
+                args,
+                model,
+                classifier,
+                img,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+            )
+
+            values = classifier(out['pred_xstart'])  # use estimated clean image for classifier input
+            loss, kkt_loss, loss_verify = calc_extraction_loss(args, l, classifier, values, img, model_kwargs['y'], x_constrain=args.x_constrain)
+            # gradient = th.autograd.grad(loss, (img, l))
+            # grad_x, grad_l = gradient
+            opt_l.zero_grad()
+            loss.backward()
+            grad_l = l.grad
+            grad_x = img.grad * args.classifier_scale
+            out["sample"] -= grad_x
+            # l = l - grad_l * args.extraction_lr
+            opt_l.step()
+
+            if (i + 1) in viz_iter:
+                os.makedirs(f'../plots/{args.plot_path}/viz_iter_{i+1}', exist_ok=True)
+                with open("../imagenet_classes.txt", "r") as f:
+                    imagenet_labels = [line.strip() for line in f.readlines()]
+                for j, im in enumerate(img):
+                    plt.imshow(im.permute(1,2,0).detach().cpu())
+                    plt.title(f'{imagenet_labels[model_kwargs["y"][j]]}')
+                    plt.savefig(f'../plots/{args.plot_path}/viz_iter_{i+1}/{j}.png')
+                    plt.close()
+
+            yield out
+            img = out["sample"]
+            img = img.detach_()
+            # l = l.detach_()
+            losses.append(loss.cpu().item())
+            kkt_losses.append(kkt_loss.cpu().item())
+            print(f'x mean: {img.mean()}')
+            print(f'l mean: {l.mean()}')
+            print(f'grad_x mean: {grad_x.mean()}')
+            print(f'grad_l mean: {grad_l.mean()}')
+            print(f'loss: {loss.item()}')
+            print(f'kkt loss: {kkt_loss.item()}')
+            # # Get the new set of tracked tensors after each iteration
+            # new_tensors = get_tracked_tensors()
+            #
+            # # Print the difference between the old and new set of tensors
+            # print(f"\n--- Iteration {i} ---")
+            # print_tracked_tensor_diff(old_tensors, new_tensors)
+            #
+            # # Update the old tensor list for the next iteration
+            # old_tensors = new_tensors
+        plt.figure(figsize=(8, 6))
+
+        # Plot the losses over iterations/epochs
+        plt.plot(losses, label='Loss')
+
+        # Add labels and title
+        plt.xlabel('Iteration (or Epoch)')
+        plt.ylabel('Loss')
+        plt.title('Loss Curve')
+
+        # Add legend
+        plt.legend()
+
+        plt.savefig(f'../plots/{args.plot_path}/loss.png')
+
+        plt.figure(figsize=(8, 6))
+
+        # Plot the losses over iterations/epochs
+        plt.plot(kkt_losses, label='Loss')
+
+        # Add labels and title
+        plt.xlabel('Iteration (or Epoch)')
+        plt.ylabel('Loss')
+        plt.title('Loss Curve')
+
+        # Add legend
+        plt.legend()
+
+        plt.savefig(f'../plots/{args.plot_path}/KKT_loss.png')
+        plt.close()
 
     def p_sample_loop_progressive(
         self,
+        args,
         model,
+        classifier,
         shape,
         noise=None,
         clip_denoised=True,
@@ -694,12 +800,32 @@ class GaussianDiffusion:
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
-
-        for i in indices:
-            t = th.tensor([i] * shape[0], device=device)
-            with th.no_grad():
-                out = self.p_sample(
+        if args.noise_input:
+            for i in indices:
+                t = th.tensor([i] * shape[0], device=device)
+                with th.no_grad():
+                    out = self.p_sample(
+                        args,
+                        model,
+                        classifier,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                    )
+                    yield out
+                    img = out["sample"]
+        else:
+            probs = []
+            for i in indices:
+                img.requires_grad_()
+                t = th.tensor([i] * shape[0], device=device)
+                out, prob = self.p_sample(
+                    args,
                     model,
+                    classifier,
                     img,
                     t,
                     clip_denoised=clip_denoised,
@@ -707,8 +833,28 @@ class GaussianDiffusion:
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
                 )
+                probs.append(prob)
                 yield out
                 img = out["sample"]
+                img.detach_()
+            output = classifier(img)
+            pred = torch.argmax(output, dim=1)
+            correct = (pred == model_kwargs['y']).sum()
+            print(f'number of correct predictions: {correct}')
+            plt.figure(figsize=(8, 6))
+
+            # Plot the losses over iterations/epochs
+            plt.plot(probs, label='Loss')
+
+            # Add labels and title
+            plt.xlabel('Iteration (or Epoch)')
+            plt.ylabel('Loss')
+            plt.title('Loss Curve')
+
+            # Add legend
+            plt.legend()
+
+            plt.savefig(f'../plots/{args.plot_path}/loss.png')
 
     def ddim_sample(
         self,

@@ -27,8 +27,9 @@ from guided_diffusion.train_util import parse_resume_step_from_filename, log_los
 
 def main():
     args = create_argparser().parse_args()
-
-    dist_util.setup_dist()
+    args.data_dir = '/home/yxpengcs/PycharmProjects/guided-diffusion/datasets/imagenet1k/ILSVRC/Data/CLS-LOC/train'
+    args.val_data_dir = '/home/yxpengcs/PycharmProjects/guided-diffusion/datasets/imagenet1k/ILSVRC/Data/CLS-LOC/val'
+    dist_util.setup_dist(1)
     logger.configure()
 
     logger.log("creating model and diffusion...")
